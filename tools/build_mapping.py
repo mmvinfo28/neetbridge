@@ -2,14 +2,21 @@
 """Rebuild data/mapping.json: NeetCode problem slug -> LeetCode problem (+ signature fixes).
 
 Sources (all public, no login needed):
-  1. https://neetcode.io/api/getProblemListFunctionHttp      -> every NeetCode problem slug
-  2. https://neetcode.io/api/getProblemMetadataFunctionHttp  -> per problem: LeetCode-style title, video id, starter code
-  3. https://leetcode.com/api/problems/all/                  -> LeetCode title / slug / question_id / premium
-  4. https://www.youtube.com/oembed                          -> video title "... - Leetcode 217 - ..." (fallback)
-  5. https://leetcode.com/graphql                            -> LeetCode code snippets per language
+  1. https://neetcode.io/practice -> main.<hash>.js          -> the "NeetCode All" table: LeetCode link, NeetCode
+                                                                slug (ncLink) and roadmap topic of every problem
+  2. https://neetcode.io/api/getProblemListFunctionHttp      -> every NeetCode problem slug
+  3. https://neetcode.io/api/getProblemMetadataFunctionHttp  -> per problem: LeetCode-style title, video id, starter code
+  4. https://leetcode.com/api/problems/all/                  -> LeetCode title / slug / question_id / premium
+  5. https://www.youtube.com/oembed                          -> video title "... - Leetcode 217 - ..." (fallback)
+  6. https://leetcode.com/graphql                            -> LeetCode code snippets per language
 
-Match order: exact title, normalised title (letters+digits only), then the LeetCode number
-parsed from the YouTube title.
+Match order: NeetCode's own table (ncLink -> LeetCode link), then for problems missing from it the
+title (normalised: letters+digits only), then the LeetCode number parsed from the YouTube title.
+
+Entry fields: s = LeetCode slug, n = LeetCode number, q = LeetCode question_id, p = LeetCode Premium,
+t = LeetCode title, k = NeetCode roadmap topic (needed to tick it), f = signature fixes (below),
+o = 1 for "NeetCode All" problems that have no NeetCode editor (NeetCode only links to LeetCode).
+Those are keyed by their LeetCode slug and can only be ticked on NeetCode, never submitted there.
 
 Signature fixes (`f` field): NeetCode's starter code is compared with LeetCode's snippet for every
 language; differing class/method names become rename pairs, and JavaScript/TypeScript solutions
@@ -31,6 +38,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
+NC_SITE = 'https://neetcode.io'
 NC_LIST = 'https://neetcode.io/api/getProblemListFunctionHttp'
 NC_META = 'https://neetcode.io/api/getProblemMetadataFunctionHttp'
 LC_ALL = 'https://leetcode.com/api/problems/all/'
@@ -55,7 +63,7 @@ USE_CURL = False
 
 # ----------------------------------------------------------------------------- http
 
-def http(url, body=None, headers=None):
+def http_text(url, body=None, headers=None):
     headers = headers or {}
     if USE_CURL:
         cmd = ['curl', '-s', '--max-time', '60', '-A', UA, url]
@@ -63,14 +71,17 @@ def http(url, body=None, headers=None):
             cmd += ['-H', f'{k}: {v}']
         if body is not None:
             cmd += ['-X', 'POST', '-H', 'content-type: application/json', '-d', json.dumps(body)]
-        out = subprocess.run(cmd, capture_output=True).stdout
-        return json.loads(out.decode('utf-8', 'replace'))
+        return subprocess.run(cmd, capture_output=True).stdout.decode('utf-8', 'replace')
     req = urllib.request.Request(url, headers={'User-Agent': UA, **headers})
     if body is not None:
         req.data = json.dumps(body).encode()
         req.add_header('content-type', 'application/json')
     with urllib.request.urlopen(req, timeout=60) as r:
-        return json.load(r)
+        return r.read().decode('utf-8', 'replace')
+
+
+def http(url, body=None, headers=None):
+    return json.loads(http_text(url, body, headers))
 
 
 def unwrap(j):
@@ -84,6 +95,25 @@ def unwrap(j):
 
 def norm(s):
     return re.sub(r'[^a-z0-9]', '', (s or '').lower())
+
+
+def nc_table():
+    """NeetCode All: the problem table compiled into the site bundle, as a list of dicts like
+    {problem, pattern, link: 'two-sum/', code: '0001-two-sum', ncLink: 'two-integer-sum/', ...}."""
+    html = http_text(NC_SITE + '/practice')
+    main = re.search(r'main\.[0-9a-f]+\.js', html)
+    if not main:
+        raise RuntimeError('main.<hash>.js not found on neetcode.io/practice')
+    js = http_text(f'{NC_SITE}/{main.group(0)}')
+    rows = []
+    for m in re.finditer(r'\{problem:"', js):
+        body = js[m.start() + 1:js.index('}', m.start())]
+        row = {}
+        for k, v in re.findall(r'(\w+):("(?:[^"\\]|\\.)*"|!0|!1)', body):
+            row[k] = json.loads(v) if v.startswith('"') else v == '!0'
+        if row.get('link') and row.get('pattern'):
+            rows.append(row)
+    return rows
 
 
 def nc_meta(slug):
@@ -202,34 +232,51 @@ def main():
     args = ap.parse_args()
     USE_CURL = args.curl
 
+    print('fetching NeetCode All table ...')
+    table = nc_table()
+    by_nc = {r['ncLink'].strip('/'): r for r in table if r.get('ncLink')}
+    link_only = [r for r in table if not r.get('ncLink')]
+    print(f'  {len(table)} problems: {len(by_nc)} with a NeetCode editor, {len(link_only)} linking to LeetCode only')
+
     print('fetching NeetCode problem list ...')
     nc_list = unwrap(http(NC_LIST, {'data': {}})) or {}
-    slugs = sorted(k for k, v in nc_list.items() if isinstance(v, dict) and v.get('tag') == 'NeetCode150')
-    print(f'  {len(slugs)} LeetCode-style problems on NeetCode')
+    listed = {k for k, v in nc_list.items() if isinstance(v, dict) and v.get('tag') == 'NeetCode150'}
+    slugs = sorted(listed | set(by_nc))
+    print(f'  {len(listed)} LeetCode-style problems on NeetCode, {len(slugs)} together with the table')
 
     print('fetching LeetCode problem list ...')
     lc = http(LC_ALL)['stat_status_pairs']
-    by_norm, by_num = {}, {}
+    by_norm, by_num, by_slug = {}, {}, {}
     for x in lc:
         s = x['stat']
         e = {'s': s['question__title_slug'], 'n': s['frontend_question_id'], 'q': s['question_id'],
              'p': 1 if x['paid_only'] else 0, 't': s['question__title']}
         by_norm[norm(e['t'])] = e
         by_num[e['n']] = e
+        by_slug[e['s']] = e
     print(f'  {len(lc)} problems on LeetCode')
+
+    def from_table(row):
+        num = re.match(r'\d+', row.get('code') or '')
+        return by_slug.get(row['link'].strip('/')) or (by_num.get(int(num.group(0))) if num else None)
 
     print('fetching NeetCode metadata (title, video, starter code) ...')
     with cf.ThreadPoolExecutor(args.workers) as ex:
         meta = dict(ex.map(nc_meta, slugs))
 
-    mapping, need_yt = {}, []
+    mapping, topics, need_yt = {}, {}, []
     for slug in slugs:
-        hit = by_norm.get(norm(meta[slug]['name']))
+        row = by_nc.get(slug)
+        hit = from_table(row) if row else None
+        if hit:
+            topics[slug] = row['pattern']
+        else:
+            hit = by_norm.get(norm(meta[slug]['name']))
         if hit:
             mapping[slug] = dict(hit)
         else:
             need_yt.append(slug)
-    print(f'  matched by title: {len(mapping)}, trying YouTube for {len(need_yt)}')
+    print(f'  matched by table: {len(topics)}, by title: {len(mapping) - len(topics)}, trying YouTube for {len(need_yt)}')
 
     with cf.ThreadPoolExecutor(args.workers) as ex:
         titles = dict(zip(need_yt, ex.map(lambda s: yt_title(meta[s]['video']) if meta[s]['video'] else None, need_yt)))
@@ -266,15 +313,31 @@ def main():
         if fixes:
             entry['f'] = fixes
             fixed_problems += 1
+    for slug, topic in topics.items():
+        mapping[slug]['k'] = topic
 
-    ordered = dict(sorted(mapping.items(), key=lambda kv: kv[1]['n']))
+    # NeetCode All problems without a NeetCode editor: keyed by LeetCode slug, tick-only
+    taken = {v['s'] for v in mapping.values()}
+    lc_only = 0
+    for row in link_only:
+        hit = from_table(row)
+        if not hit:
+            unmapped.append((row['link'], row.get('problem')))
+        elif hit['s'] in mapping or hit['s'] in taken:
+            print(f'  skipped link-only {hit["s"]}: already mapped')
+        else:
+            mapping[hit['s']] = dict(hit, k=row['pattern'], o=1)
+            lc_only += 1
+
+    ordered = dict(sorted(mapping.items(), key=lambda kv: (kv[1]['n'], kv[0])))
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open('w', encoding='utf-8') as f:
         f.write('{\n' + ',\n'.join(f'  {json.dumps(k)}: {json.dumps(v, ensure_ascii=False, separators=(",", ":"))}'
                                     for k, v in ordered.items()) + '\n}\n')
-    print(f'wrote {out}: {len(ordered)} entries, {sum(v["p"] for v in ordered.values())} LeetCode premium, '
-          f'{fixed_problems} with signature fixes')
+    print(f'wrote {out}: {len(ordered)} entries ({len(ordered) - lc_only} with a NeetCode editor, {lc_only} tick-only), '
+          f'{sum(v["p"] for v in ordered.values() if not v.get("o"))} of the editor ones LeetCode premium, '
+          f'{fixed_problems} with signature fixes, {sum(1 for v in ordered.values() if "k" not in v)} without topic')
     if unaligned:
         print(f'{len(unaligned)} problem/language pairs could not be aligned (extension falls back to a heuristic):')
         for slug, lang in unaligned[:30]:

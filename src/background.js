@@ -79,9 +79,13 @@ async function loadBuiltinMapping() {
   return builtinMapping;
 }
 
+// `o` entries are NeetCode All problems without a NeetCode editor (keyed by LeetCode slug): they can
+// be ticked on NeetCode, but there is no NeetCode judge or submission history for them.
 function entryFromCompact(problemId, c) {
-  return { problemId, slug: c.s, num: c.n, questionId: c.q, premium: !!c.p, title: c.t, fixes: c.f || null, topic: c.k || null };
+  return { problemId, slug: c.s, num: c.n, questionId: c.q, premium: !!c.p, title: c.t, fixes: c.f || null, topic: c.k || null, lcOnly: !!c.o };
 }
+
+const NC_ALL_URL = 'https://neetcode.io/practice/practice/allNC';
 
 // LeetCode slug -> NeetCode mapping entry (bundled + live-resolved)
 async function resolveByLeetCodeSlug(lcSlug) {
@@ -96,7 +100,8 @@ async function resolveByLeetCodeSlug(lcSlug) {
 // NeetCode's getCompletedProblems answers with LeetCode links grouped by list/topic, e.g.
 // { "Arrays & Hashing": ["contains-duplicate/", "two-sum/"], ... }. Collect every string in the
 // structure, normalise it to a slug and translate LeetCode slugs to NeetCode slugs.
-async function completedToIds(raw) {
+// `withEditor` drops the tick-only problems (nothing to read from NeetCode for those).
+async function completedToIds(raw, { withEditor = false } = {}) {
   const builtin = await loadBuiltinMapping();
   const { mappingExtra = {} } = await getLocal('mappingExtra');
   const all = { ...mappingExtra, ...builtin };
@@ -118,9 +123,9 @@ async function completedToIds(raw) {
     const s = String(s0).trim().replace(/^https?:\/\/[^/]+/, '').replace(/^\/?problems\//, '').replace(/^\//, '')
       .split(/[?#]/)[0].replace(/\/+$/, '');
     if (!s) continue;
-    if (byLc[s]) ids.add(byLc[s]);
-    else if (all[s]) ids.add(s);
-    else unknown.add(s);
+    const id = byLc[s] || (all[s] ? s : null);
+    if (!id) unknown.add(s);
+    else if (!(withEditor && all[id].o)) ids.add(id);
   }
   return { ids: [...ids], unknown: [...unknown] };
 }
@@ -351,19 +356,21 @@ async function enqueueReverse(raw, source, { dryRun = false, level = null, retic
   if (!map) return { reason: `${lcSlug} is not on NeetCode.`, level: 'silent' };
   const label = `#${map.num} ${map.title}`;
   const ncLang = LC2NC[String(raw.lang || '').toLowerCase()];
-  if (mode === 'submit' && !ncLang) {
+  // problems without a NeetCode editor have no judge: tick only
+  const judge = mode === 'submit' && !map.lcOnly;
+  if (judge && !ncLang) {
     await appendLog({ problemId: map.problemId, lang: raw.lang, source, direction: 'lc2nc', status: 'Skipped (language)', title: map.title, num: map.num, slug: map.slug,
       detail: `NeetCode has no ${raw.lang} judge; only the roadmap tick will be applied.` });
   }
 
-  const key = `lc2nc|${map.problemId}|${ncLang || 'mark'}|${mode === 'submit' && ncLang ? hashCode(raw.code) : 'mark'}`;
+  const key = `lc2nc|${map.problemId}|${ncLang || 'mark'}|${judge && ncLang ? hashCode(raw.code) : 'mark'}`;
   const { synced = {} } = await getLocal('synced');
   if (!retick && !settings.resubmitIdentical && synced[key] && synced[key].status === 'Accepted') {
     return { reason: `${label}: already synced to NeetCode.`, level: 'info', duplicate: true };
   }
   if (dryRun) {
-    await appendLog({ problemId: map.problemId, lang: raw.lang, source, direction: 'lc2nc', status: 'Dry run', title: map.title, num: map.num, slug: map.slug,
-      detail: mode === 'submit' && ncLang ? `would submit ${raw.code.length} chars of ${ncLang} to NeetCode and tick ${map.topic || '?'}` : `would tick ${map.topic || '?'} on NeetCode` });
+    await appendLog({ problemId: map.problemId, lang: raw.lang, source, direction: 'lc2nc', status: 'Dry run', title: map.title, num: map.num, slug: map.slug, lcOnly: map.lcOnly,
+      detail: judge && ncLang ? `would submit ${raw.code.length} chars of ${ncLang} to NeetCode and tick ${map.topic || '?'}` : `would tick ${map.topic || '?'} on NeetCode` });
     return { queued: true, dryRun: true, title: label };
   }
 
@@ -371,9 +378,9 @@ async function enqueueReverse(raw, source, { dryRun = false, level = null, retic
     if (queue.some((q) => q.key === key)) return false;
     queue.push({
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      key, direction: 'lc2nc', mode: mode === 'submit' && ncLang ? 'submit' : 'mark',
+      key, direction: 'lc2nc', mode: judge && ncLang ? 'submit' : 'mark',
       problemId: map.problemId, source, lcLang: raw.lang, ncLang, code: raw.code, at: raw.at || Date.now(), attempts: 0,
-      map: { slug: map.slug, num: map.num, questionId: map.questionId, title: map.title, premium: map.premium, fixes: map.fixes || null, topic: map.topic },
+      map: { slug: map.slug, num: map.num, questionId: map.questionId, title: map.title, premium: map.premium, fixes: map.fixes || null, topic: map.topic, lcOnly: map.lcOnly },
     });
     return true;
   });
@@ -503,9 +510,9 @@ async function handleItem(item) {
 
 // LeetCode -> NeetCode: optional judge submission, then tick the roadmap. Returns like handleItem.
 async function handleReverseItem(item) {
-  const { num, title, topic, slug } = item.map;
+  const { num, title, topic, slug, lcOnly } = item.map;
   const label = `NeetCode ${title}`;
-  const problemUrl = `https://neetcode.io/problems/${item.problemId}`;
+  const problemUrl = lcOnly ? NC_ALL_URL : `https://neetcode.io/problems/${item.problemId}`;
   let tabId;
   try {
     tabId = await getNeetCodeTabId();
@@ -582,7 +589,7 @@ async function handleReverseItem(item) {
 }
 
 const logBaseReverse = (item) => ({ problemId: item.problemId, lang: item.ncLang || item.lcLang, source: item.source, direction: 'lc2nc',
-  title: item.map.title, num: item.map.num, slug: item.map.slug });
+  title: item.map.title, num: item.map.num, slug: item.map.slug, lcOnly: !!item.map.lcOnly });
 
 async function resolveReverseFix(item) {
   const lang = item.lcLang;
@@ -665,7 +672,7 @@ async function startReverseBulk(options = {}) {
       found += 1;
       let code = null;
       let lang = 'python3';
-      if (mode === 'submit') {
+      if (mode === 'submit' && !map.lcOnly) {
         try {
           const tabId = await getLeetCodeTabId();
           const r = await runInTab(tabId, lcLastAcceptedInPage, { slug: e.slug });
@@ -950,7 +957,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return { queued };
       }
       case 'N2L_COMPLETED_TO_IDS':
-        return completedToIds(msg.raw);
+        return completedToIds(msg.raw, { withEditor: true });
       case 'N2L_BULK_PROGRESS': {
         const { bulk = {} } = await getLocal('bulk');
         await setLocal({ bulk: { ...bulk, running: true, phase: msg.phase, updatedAt: Date.now(),

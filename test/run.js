@@ -221,6 +221,9 @@ const settle = () => new Promise((r) => realSetTimeout(r, 150));
   } });
   assert.deepStrictEqual(r.ids.sort(), ['anagram-groups', 'buy-and-sell-crypto', 'duplicate-integer', 'permutation-string', 'three-integer-sum', 'two-integer-sum'].sort(), JSON.stringify(r));
   assert.deepStrictEqual(r.unknown, ['something-unknown']);
+  // tick-only problems (no NeetCode editor) are known, but have nothing to collect from NeetCode
+  r = await send({ type: 'N2L_COMPLETED_TO_IDS', raw: { 'Linked List': ['swap-nodes-in-pairs/', 'reverse-linked-list/'] } });
+  assert.deepStrictEqual(r, { ids: ['reverse-a-linked-list'], unknown: [] }, JSON.stringify(r));
 
   // 13. LeetCode -> NeetCode, level "submit": reverse rename, judge call, roadmap tick
   await send({ type: 'setSettings', settings: { lc2nc: 'submit' } });
@@ -252,6 +255,19 @@ const settle = () => new Promise((r) => realSetTimeout(r, 150));
   await settle();
   const jsSubmit = sentToTabs.find((s) => s.msg.type === 'N2L_NC_SUBMIT');
   assert.ok(jsSubmit.msg.code.includes('class Solution {') && jsSubmit.msg.code.includes('twoSum(...args) { return twoSum(...args); }'), jsSubmit.msg.code);
+
+  // 14b. NeetCode All problem without a NeetCode editor: level "submit" still only ticks
+  sentToTabs.length = 0;
+  r = await send({ type: 'N2L_LC_ACCEPTED', source: 'live', slug: 'swap-nodes-in-pairs', lang: 'python3', code: 'class Solution: pass' });
+  assert.strictEqual(r.queued, true, JSON.stringify(r));
+  assert.strictEqual(r.title, '#24 Swap Nodes in Pairs');
+  await settle();
+  assert.ok(!sentToTabs.some((s) => s.msg.type === 'N2L_NC_SUBMIT'), 'no NeetCode judge for tick-only problems');
+  const lcOnlyMark = sentToTabs.find((s) => s.msg.type === 'N2L_NC_MARK');
+  assert.deepStrictEqual({ topic: lcOnlyMark.msg.topic, link: lcOnlyMark.msg.link }, { topic: 'Linked List', link: 'https://leetcode.com/problems/swap-nodes-in-pairs/' });
+  st = await send({ type: 'getState' });
+  assert.strictEqual(st.log[0].lcOnly, true);
+  assert.strictEqual(st.log[0].url, 'https://neetcode.io/practice/practice/allNC');
 
   // 15. level "mark": no judge call, only the tick; not-on-NeetCode problems are silently ignored
   await send({ type: 'setSettings', settings: { lc2nc: 'mark' } });

@@ -46,7 +46,7 @@ function renderLog(log) {
     s.textContent = e.status || '';
     li.append(t, s);
     const links = [];
-    if (e.problemId) links.push(['NeetCode', `https://neetcode.io/problems/${e.problemId}`]);
+    if (e.problemId) links.push(['NeetCode', e.lcOnly ? 'https://neetcode.io/practice/practice/allNC' : `https://neetcode.io/problems/${e.problemId}`]);
     if (e.url && /leetcode\.com/.test(e.url)) links.push(['LeetCode submission', e.url]);
     else if (e.slug) links.push(['LeetCode', `https://leetcode.com/problems/${e.slug}/`]);
     if (e.detail || links.length) {
