@@ -125,6 +125,29 @@ async function completedToIds(raw) {
   return { ids: [...ids], unknown: [...unknown] };
 }
 
+// The practice checkbox is on only for this exact URL. A leftover "<slug>/" does not count:
+// unticking removes the full URL and leaves the short one in place.
+function lcRoadmapLink(slug) {
+  return `https://leetcode.com/problems/${String(slug || '').replace(/^\/+|\/+$/g, '')}/`;
+}
+
+function roadmapTickedSlugs(raw) {
+  const strings = [];
+  const walk = (x, depth) => {
+    if (x == null || depth > 4) return;
+    if (typeof x === 'string') strings.push(x);
+    else if (Array.isArray(x)) x.forEach((v) => walk(v, depth + 1));
+    else if (typeof x === 'object') Object.values(x).forEach((v) => walk(v, depth + 1));
+  };
+  walk(raw, 0);
+  const slugs = new Set();
+  for (const s0 of strings) {
+    const m = /^https:\/\/leetcode\.com\/problems\/([^/?#]+)\/$/.exec(String(s0).trim());
+    if (m) slugs.add(m[1]);
+  }
+  return slugs;
+}
+
 // NeetCode language id <- LeetCode slug (for starter-code lookups)
 const LC2NC = Object.fromEntries(Object.entries(LANG_MAP).map(([nc, lc]) => [lc, nc]));
 
@@ -317,7 +340,7 @@ async function enqueue(raw, source, { dryRun = false } = {}) {
 }
 
 // LeetCode -> NeetCode. `raw` = {slug, lang (LeetCode slug), code, ...}
-async function enqueueReverse(raw, source, { dryRun = false, level = null } = {}) {
+async function enqueueReverse(raw, source, { dryRun = false, level = null, retick = false } = {}) {
   const settings = await getSettings();
   const mode = level || settings.lc2nc;
   if (!mode || mode === 'off') return { reason: 'LeetCode -> NeetCode sync is off.', level: 'silent' };
@@ -335,7 +358,7 @@ async function enqueueReverse(raw, source, { dryRun = false, level = null } = {}
 
   const key = `lc2nc|${map.problemId}|${ncLang || 'mark'}|${mode === 'submit' && ncLang ? hashCode(raw.code) : 'mark'}`;
   const { synced = {} } = await getLocal('synced');
-  if (!settings.resubmitIdentical && synced[key] && synced[key].status === 'Accepted') {
+  if (!retick && !settings.resubmitIdentical && synced[key] && synced[key].status === 'Accepted') {
     return { reason: `${label}: already synced to NeetCode.`, level: 'info', duplicate: true };
   }
   if (dryRun) {
@@ -536,7 +559,8 @@ async function handleReverseItem(item) {
   // Tick the roadmap regardless of the judge result (the LeetCode verdict was Accepted).
   if (topic) {
     try {
-      const m = await chrome.tabs.sendMessage(tabId, { type: 'N2L_NC_MARK', topic, link: `${slug}/` });
+      // Practice checkboxes compare this full URL, not the short "<slug>/" form.
+      const m = await chrome.tabs.sendMessage(tabId, { type: 'N2L_NC_MARK', topic, link: lcRoadmapLink(slug) });
       parts.push(m && m.ok ? `ticked in ${topic}` : `tick failed: ${(m && m.error) || 'no response'}`);
     } catch (err) {
       parts.push(`tick failed: ${String((err && err.message) || err)}`);
@@ -618,12 +642,13 @@ async function startReverseBulk(options = {}) {
     const accepted = Object.values(idx.bySlug).filter((e) => e.status === 'ac');
     await setLocal({ bulk: { ...(await getLocal('bulk')).bulk, phase: 'collecting', updatedAt: Date.now(), total: accepted.length } });
 
-    // what is already ticked on NeetCode
-    let done = new Set();
+    // Already ticked means the practice checkbox URL is stored. A short "<slug>/" left
+    // behind after an untick does not light that checkbox, so it must be ticked again.
+    let ticked = new Set();
     try {
       const tabId = await getNeetCodeTabId();
       const c = await chrome.tabs.sendMessage(tabId, { type: 'N2L_NC_COMPLETED' });
-      if (c && c.ok) done = new Set((await completedToIds(c.raw)).ids);
+      if (c && c.ok) ticked = roadmapTickedSlugs(c.raw);
     } catch (err) {
       console.warn('[neetbridge] could not read NeetCode progress', err);
     }
@@ -636,7 +661,7 @@ async function startReverseBulk(options = {}) {
       if (reverseAbort) break;
       n += 1;
       const map = await resolveByLeetCodeSlug(e.slug);
-      if (!map || done.has(map.problemId)) continue;
+      if (!map || ticked.has(map.slug)) continue;
       found += 1;
       let code = null;
       let lang = 'python3';
@@ -650,7 +675,7 @@ async function startReverseBulk(options = {}) {
         }
       }
       await enqueueReverse({ slug: e.slug, lang, code: code || '# accepted on LeetCode', at: Date.now() }, 'bulk',
-        { dryRun: !!options.dryRun, level: code ? 'submit' : 'mark' });
+        { dryRun: !!options.dryRun, level: code ? 'submit' : 'mark', retick: true });
       const { bulk = {} } = await getLocal('bulk');
       await setLocal({ bulk: { ...bulk, done: n, found, queued: found, updatedAt: Date.now() } });
     }
