@@ -136,7 +136,9 @@ function lcRoadmapLink(slug) {
   return `https://leetcode.com/problems/${String(slug || '').replace(/^\/+|\/+$/g, '')}/`;
 }
 
-function roadmapTickedSlugs(raw) {
+// LeetCode slugs in NeetCode's progress. `ticked`: full URL stored, checkbox on. `short`: only a
+// "<slug>/" stored, from a tick by an older version or left behind by an untick.
+function roadmapSlugs(raw) {
   const strings = [];
   const walk = (x, depth) => {
     if (x == null || depth > 4) return;
@@ -145,12 +147,15 @@ function roadmapTickedSlugs(raw) {
     else if (typeof x === 'object') Object.values(x).forEach((v) => walk(v, depth + 1));
   };
   walk(raw, 0);
-  const slugs = new Set();
+  const ticked = new Set();
+  const short = new Set();
   for (const s0 of strings) {
-    const m = /^https:\/\/leetcode\.com\/problems\/([^/?#]+)\/$/.exec(String(s0).trim());
-    if (m) slugs.add(m[1]);
+    const s = String(s0).trim();
+    const m = /^https:\/\/leetcode\.com\/problems\/([^/?#]+)\/$/.exec(s);
+    if (m) ticked.add(m[1]);
+    else if (/^[^/?#:]+\/$/.test(s)) short.add(s.slice(0, -1));
   }
-  return slugs;
+  return { ticked, short };
 }
 
 // NeetCode language id <- LeetCode slug (for starter-code lookups)
@@ -345,7 +350,7 @@ async function enqueue(raw, source, { dryRun = false } = {}) {
 }
 
 // LeetCode -> NeetCode. `raw` = {slug, lang (LeetCode slug), code, ...}
-async function enqueueReverse(raw, source, { dryRun = false, level = null, retick = false } = {}) {
+async function enqueueReverse(raw, source, { dryRun = false, level = null } = {}) {
   const settings = await getSettings();
   const mode = level || settings.lc2nc;
   if (!mode || mode === 'off') return { reason: 'LeetCode -> NeetCode sync is off.', level: 'silent' };
@@ -365,12 +370,12 @@ async function enqueueReverse(raw, source, { dryRun = false, level = null, retic
 
   const key = `lc2nc|${map.problemId}|${ncLang || 'mark'}|${judge && ncLang ? hashCode(raw.code) : 'mark'}`;
   const { synced = {} } = await getLocal('synced');
-  if (!retick && !settings.resubmitIdentical && synced[key] && synced[key].status === 'Accepted') {
-    return { reason: `${label}: already synced to NeetCode.`, level: 'info', duplicate: true };
-  }
+  // Already synced: tick the roadmap again (an untick on NeetCode clears it), but skip the judge.
+  const alreadySynced = !settings.resubmitIdentical && synced[key] && synced[key].status === 'Accepted';
+  const submit = judge && !!ncLang && !alreadySynced;
   if (dryRun) {
     await appendLog({ problemId: map.problemId, lang: raw.lang, source, direction: 'lc2nc', status: 'Dry run', title: map.title, num: map.num, slug: map.slug, lcOnly: map.lcOnly,
-      detail: judge && ncLang ? `would submit ${raw.code.length} chars of ${ncLang} to NeetCode and tick ${map.topic || '?'}` : `would tick ${map.topic || '?'} on NeetCode` });
+      detail: submit ? `would submit ${raw.code.length} chars of ${ncLang} to NeetCode and tick ${map.topic || '?'}` : `would tick ${map.topic || '?'} on NeetCode` });
     return { queued: true, dryRun: true, title: label };
   }
 
@@ -378,7 +383,7 @@ async function enqueueReverse(raw, source, { dryRun = false, level = null, retic
     if (queue.some((q) => q.key === key)) return false;
     queue.push({
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      key, direction: 'lc2nc', mode: judge && ncLang ? 'submit' : 'mark',
+      key, direction: 'lc2nc', mode: submit ? 'submit' : 'mark',
       problemId: map.problemId, source, lcLang: raw.lang, ncLang, code: raw.code, at: raw.at || Date.now(), attempts: 0,
       map: { slug: map.slug, num: map.num, questionId: map.questionId, title: map.title, premium: map.premium, fixes: map.fixes || null, topic: map.topic, lcOnly: map.lcOnly },
     });
@@ -651,14 +656,17 @@ async function startReverseBulk(options = {}) {
 
     // Already ticked means the practice checkbox URL is stored. A short "<slug>/" left
     // behind after an untick does not light that checkbox, so it must be ticked again.
-    let ticked = new Set();
+    let roadmap = { ticked: new Set(), short: new Set() };
     try {
       const tabId = await getNeetCodeTabId();
       const c = await chrome.tabs.sendMessage(tabId, { type: 'N2L_NC_COMPLETED' });
-      if (c && c.ok) ticked = roadmapTickedSlugs(c.raw);
+      if (c && c.ok) roadmap = roadmapSlugs(c.raw);
     } catch (err) {
       console.warn('[neetbridge] could not read NeetCode progress', err);
     }
+    // Problems this extension already sent to NeetCode (any outcome; the tick was applied either way)
+    const { synced = {} } = await getLocal('synced');
+    const syncedBefore = new Set(Object.keys(synced).filter((k) => k.startsWith('lc2nc|')).map((k) => k.split('|')[1]));
 
     const settings = await getSettings();
     const mode = options.level || (settings.lc2nc === 'off' ? 'mark' : settings.lc2nc);
@@ -668,11 +676,13 @@ async function startReverseBulk(options = {}) {
       if (reverseAbort) break;
       n += 1;
       const map = await resolveByLeetCodeSlug(e.slug);
-      if (!map || ticked.has(map.slug)) continue;
+      if (!map || roadmap.ticked.has(map.slug)) continue;
       found += 1;
+      // Ticked before (short link, or synced by this extension): tick again without a second judge run.
+      const tickOnly = map.lcOnly || roadmap.short.has(map.slug) || syncedBefore.has(map.problemId);
       let code = null;
       let lang = 'python3';
-      if (mode === 'submit' && !map.lcOnly) {
+      if (mode === 'submit' && !tickOnly) {
         try {
           const tabId = await getLeetCodeTabId();
           const r = await runInTab(tabId, lcLastAcceptedInPage, { slug: e.slug });
@@ -682,7 +692,7 @@ async function startReverseBulk(options = {}) {
         }
       }
       await enqueueReverse({ slug: e.slug, lang, code: code || '# accepted on LeetCode', at: Date.now() }, 'bulk',
-        { dryRun: !!options.dryRun, level: code ? 'submit' : 'mark', retick: true });
+        { dryRun: !!options.dryRun, level: code ? 'submit' : 'mark' });
       const { bulk = {} } = await getLocal('bulk');
       await setLocal({ bulk: { ...bulk, done: n, found, queued: found, updatedAt: Date.now() } });
     }
