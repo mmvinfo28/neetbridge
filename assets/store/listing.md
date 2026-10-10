@@ -15,13 +15,13 @@ Solve on NeetCode or LeetCode — both stay in sync.
 
 NeetCode → LeetCode: get a problem accepted on neetcode.io and the same code is submitted to the matching LeetCode problem. The LeetCode verdict shows up right on the NeetCode page.
 
-LeetCode → NeetCode: get a problem accepted on leetcode.com and it is ticked in your NeetCode roadmap (NeetCode 150 / 250 / Blind 75). Optionally the code is submitted to NeetCode as well, so it appears in your NeetCode submission history.
+LeetCode → NeetCode: get a problem accepted on leetcode.com and it is ticked in your NeetCode roadmap (NeetCode 150 / 250 / Blind 75 / NeetCode All). Optionally the code is submitted to NeetCode as well, so it appears in your NeetCode submission history.
 
 Backfill: one click syncs everything you already solved, in either direction. A "Preview only" mode lists what would happen before anything is sent.
 
 How it works
 • The extension watches the site's own Submit button — nothing to copy, nothing to configure.
-• 588 NeetCode problems are mapped to their LeetCode counterparts, including renamed problems (two-integer-sum → two-sum) and renamed methods (hasDuplicate → containsDuplicate). JavaScript/TypeScript solutions are adapted between NeetCode's class Solution and LeetCode's plain functions automatically.
+• All 973 NeetCode All problems are mapped to their LeetCode counterparts, including renamed problems (two-integer-sum → two-sum) and renamed methods (hasDuplicate → containsDuplicate). JavaScript/TypeScript solutions are adapted between NeetCode's class Solution and LeetCode's plain functions automatically.
 • Submissions use the sessions you are already logged in with and are spaced out to respect both sites' rate limits.
 • Every verdict is shown as a toast on the page and, optionally, as a desktop notification.
 
@@ -29,7 +29,7 @@ Privacy
 Everything runs inside your browser. Your code goes only to neetcode.io and leetcode.com, exactly as the sites' own Submit buttons send it. Nothing is sent to the developer or to any third party; no analytics, no tracking.
 
 Limitations
-• Only the problems that exist on NeetCode can be synced (588 at the time of writing).
+• Only the problems listed on NeetCode can be synced (973 at the time of writing). The 385 that NeetCode only links to LeetCode have no NeetCode editor, so they are ticked but never submitted to NeetCode.
 • LeetCode Premium problems are skipped unless you enable them and have Premium.
 • Unofficial; not affiliated with NeetCode or LeetCode.
 

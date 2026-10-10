@@ -90,6 +90,7 @@ global.chrome = {
       }
       if (func.name === 'lcFetchAllInPage') return [{ result: { ok: false } }];
       if (func.name === 'lcSnippetInPage') return [{ result: { ok: true, code: args[0].slug === 'brand-new-problem' ? LC_SNIPPET : null } }];
+      if (func.name === 'lcLastAcceptedInPage') return [{ result: { ok: true, code: LC_JS_TWO_SUM, lang: 'javascript' } }];
       throw new Error('unknown injected function ' + func.name);
     },
   },
@@ -221,6 +222,9 @@ const settle = () => new Promise((r) => realSetTimeout(r, 150));
   } });
   assert.deepStrictEqual(r.ids.sort(), ['anagram-groups', 'buy-and-sell-crypto', 'duplicate-integer', 'permutation-string', 'three-integer-sum', 'two-integer-sum'].sort(), JSON.stringify(r));
   assert.deepStrictEqual(r.unknown, ['something-unknown']);
+  // tick-only problems (no NeetCode editor) are known, but have nothing to collect from NeetCode
+  r = await send({ type: 'N2L_COMPLETED_TO_IDS', raw: { 'Linked List': ['swap-nodes-in-pairs/', 'reverse-linked-list/'] } });
+  assert.deepStrictEqual(r, { ids: ['reverse-a-linked-list'], unknown: [] }, JSON.stringify(r));
 
   // 13. LeetCode -> NeetCode, level "submit": reverse rename, judge call, roadmap tick
   await send({ type: 'setSettings', settings: { lc2nc: 'submit' } });
@@ -245,6 +249,17 @@ const settle = () => new Promise((r) => realSetTimeout(r, 150));
   assert.ok(sentToTabs.some((s) => s.id === 7 && s.msg.type === 'N2L_RESULT' && /NeetCode Contains Duplicate: Accepted/.test(s.msg.text)), 'toast on the leetcode tab');
   assert.ok(sentToTabs.some((s) => s.id === 9 && s.msg.type === 'N2L_RESULT' && /NeetCode Contains Duplicate: Accepted/.test(s.msg.text)), 'toast on the neetcode tab too');
 
+  // 13b. same code accepted again: already synced, so the roadmap tick is repeated (it may have
+  // been unticked on NeetCode) without a second judge run
+  sentToTabs.length = 0;
+  r = await send({ type: 'N2L_LC_ACCEPTED', source: 'live', slug: 'contains-duplicate', lang: 'python3', code: LC_PY_CONTAINS });
+  assert.strictEqual(r.queued, true, JSON.stringify(r));
+  await settle();
+  assert.ok(!sentToTabs.some((s) => s.msg.type === 'N2L_NC_SUBMIT'), 'no second judge run');
+  assert.ok(sentToTabs.some((s) => s.msg.type === 'N2L_NC_MARK' && s.msg.link === 'https://leetcode.com/problems/contains-duplicate/'));
+  st = await send({ type: 'getState' });
+  assert.ok(/ticked in Arrays & Hashing/.test(st.log[0].detail), st.log[0].detail);
+
   // 14. JS: LeetCode plain function gets a class Solution wrapper for NeetCode
   sentToTabs.length = 0;
   r = await send({ type: 'N2L_LC_ACCEPTED', source: 'live', slug: 'two-sum', lang: 'javascript', code: LC_JS_TWO_SUM });
@@ -252,6 +267,19 @@ const settle = () => new Promise((r) => realSetTimeout(r, 150));
   await settle();
   const jsSubmit = sentToTabs.find((s) => s.msg.type === 'N2L_NC_SUBMIT');
   assert.ok(jsSubmit.msg.code.includes('class Solution {') && jsSubmit.msg.code.includes('twoSum(...args) { return twoSum(...args); }'), jsSubmit.msg.code);
+
+  // 14b. NeetCode All problem without a NeetCode editor: level "submit" still only ticks
+  sentToTabs.length = 0;
+  r = await send({ type: 'N2L_LC_ACCEPTED', source: 'live', slug: 'swap-nodes-in-pairs', lang: 'python3', code: 'class Solution: pass' });
+  assert.strictEqual(r.queued, true, JSON.stringify(r));
+  assert.strictEqual(r.title, '#24 Swap Nodes in Pairs');
+  await settle();
+  assert.ok(!sentToTabs.some((s) => s.msg.type === 'N2L_NC_SUBMIT'), 'no NeetCode judge for tick-only problems');
+  const lcOnlyMark = sentToTabs.find((s) => s.msg.type === 'N2L_NC_MARK');
+  assert.deepStrictEqual({ topic: lcOnlyMark.msg.topic, link: lcOnlyMark.msg.link }, { topic: 'Linked List', link: 'https://leetcode.com/problems/swap-nodes-in-pairs/' });
+  st = await send({ type: 'getState' });
+  assert.strictEqual(st.log[0].lcOnly, true);
+  assert.strictEqual(st.log[0].url, 'https://neetcode.io/practice/practice/allNC');
 
   // 15. level "mark": no judge call, only the tick; not-on-NeetCode problems are silently ignored
   await send({ type: 'setSettings', settings: { lc2nc: 'mark' } });
@@ -282,6 +310,28 @@ const settle = () => new Promise((r) => realSetTimeout(r, 150));
   assert.strictEqual(st.bulk.found, 1, JSON.stringify(st.bulk));
   assert.ok(st.log.some((e) => e.slug === 'contains-duplicate' && e.status === 'Dry run'));
   assert.ok(!st.log.some((e) => e.slug === 'two-sum'));
+
+  // 17b. reverse bulk at level "submit": a problem ticked before (short link left on NeetCode, or
+  // synced by this extension with any outcome) is ticked again without fetching code or a judge run.
+  await send({ type: 'setSettings', settings: { lc2nc: 'submit' } });
+  const forwardSynced = Object.fromEntries(Object.entries(store.synced).filter(([k]) => !k.startsWith('lc2nc|')));
+  const bulkDryRun = async (synced) => {
+    store.synced = { ...forwardSynced, ...synced };
+    await send({ type: 'clearLog' });
+    injected.length = 0;
+    await send({ type: 'startReverseBulk', options: { dryRun: true } });
+    await settle();
+    return send({ type: 'getState' });
+  };
+  ncCompleted = { 'Arrays & Hashing': ['contains-duplicate/'] };
+  st = await bulkDryRun({});
+  assert.strictEqual(st.bulk.found, 2, JSON.stringify(st.bulk));
+  assert.strictEqual(st.log.find((e) => e.slug === 'contains-duplicate').detail, 'would tick Arrays & Hashing on NeetCode');
+  assert.ok(/^would submit \d+ chars of javascript/.test(st.log.find((e) => e.slug === 'two-sum').detail));
+  assert.deepStrictEqual(injected.filter((f) => f === 'lcLastAcceptedInPage'), ['lcLastAcceptedInPage'], 'code fetched for two-sum only');
+  st = await bulkDryRun({ 'lc2nc|two-integer-sum|javascript|123': { status: 'Wrong Answer', at: 1 } });
+  assert.strictEqual(st.log.find((e) => e.slug === 'two-sum').detail, 'would tick Arrays & Hashing on NeetCode');
+  assert.ok(!injected.includes('lcLastAcceptedInPage'));
 
   console.log('all background tests passed');
   process.exit(0);

@@ -7,7 +7,7 @@
 Two-way sync between [NeetCode](https://neetcode.io) and [LeetCode](https://leetcode.com), as a Chrome extension:
 
 - **NeetCode → LeetCode** — get a problem *Accepted* on NeetCode and the same solution is submitted to the matching LeetCode problem; the LeetCode verdict shows up on the NeetCode page.
-- **LeetCode → NeetCode** — get a problem *Accepted* on LeetCode and it is ticked in your NeetCode roadmap (NeetCode 150 / 250 / Blind 75); optionally the code is also submitted to NeetCode's judge so it appears in your NeetCode submission history.
+- **LeetCode → NeetCode** — get a problem *Accepted* on LeetCode and it is ticked in your NeetCode roadmap (NeetCode 150 / 250 / Blind 75 / NeetCode All); optionally the code is also submitted to NeetCode's judge so it appears in your NeetCode submission history.
 - **Backfill** in both directions for everything you already solved.
 
 No GitHub, no API keys, no copying cookies. The extension runs inside your browser and uses the sessions you are already logged in with on both sites.
@@ -41,7 +41,7 @@ Works on Chrome, Edge, Brave and other Chromium browsers (Manifest V3, Chrome 11
 | **LeetCode → NeetCode** card | When a LeetCode submission is accepted: `do nothing` · `tick the NeetCode roadmap` (default) · `tick + submit code to NeetCode`. |
 | *Sync everything I solved on …* | Backfill button in each card, see below. |
 | Preview only | Backfills only collect and list what they would do (see *Recent*); untick to run them for real. |
-| Also submit LeetCode Premium problems | 161 of the 588 mapped problems are Premium on LeetCode; off by default. |
+| Also submit LeetCode Premium problems | 161 of the 588 problems with a NeetCode editor are Premium on LeetCode; off by default. |
 | Desktop notification | Windows/macOS notification with every verdict; click it to open the submission. |
 | Wait … s between submissions | Minimum gap between two submissions (any direction); 30 by default, 10 minimum. |
 
@@ -62,7 +62,7 @@ Submissions are spaced out (30 s by default) to stay well within both sites' rat
 |---|---|---|
 | Detect | `src/neetcode-hook.js`, `src/leetcode-hook.js` (page world) | Wrap `XMLHttpRequest`/`fetch` on each site and watch the site's own submit call (`/api/executeCodeFunctionHttp` on NeetCode, `/problems/<slug>/submit/` + `/submissions/detail/<id>/check/` on LeetCode). Grab problem, language, code and verdict. Only page-initiated requests are seen, so the two directions cannot trigger each other. |
 | Relay | `src/neetcode-content.js`, `src/leetcode-content.js` | Forward accepted submissions to the service worker, show toasts; the NeetCode one also executes the reverse direction (judge call, roadmap tick) and the bulk collection with your NeetCode session. |
-| Map | `data/mapping.json` | NeetCode slug → LeetCode slug / number / internal `question_id` / premium flag / NeetCode topic. 588 problems, verified against NeetCode's own problem table. Unknown slugs are resolved live (NeetCode title → LeetCode title, YouTube video title as fallback) and cached. |
+| Map | `data/mapping.json` | NeetCode slug → LeetCode slug / number / internal `question_id` / premium flag / NeetCode topic. All 973 problems of NeetCode All, taken from NeetCode's own problem table: 588 with a NeetCode editor, 385 that NeetCode only links to LeetCode (tick-only, keyed by LeetCode slug). Unknown slugs are resolved live (NeetCode title → LeetCode title, YouTube video title as fallback) and cached. |
 | Adapt | `src/sigfix.js` | Rewrites the few names that differ between the sites (`hasDuplicate` ↔ `containsDuplicate`, `PrefixTree` ↔ `Trie`, ...) and, for JavaScript/TypeScript, bridges the shapes: LeetCode calls plain functions, NeetCode calls methods on `class Solution`, so shims/wrappers are appended in whichever direction is needed. Fixes are precomputed for every problem/language pair in the mapping and computed live (NeetCode starter vs LeetCode snippet) for the rest. |
 | Submit | `src/background.js` | Keeps one persistent queue for both directions. NeetCode → LeetCode runs the submit + verdict polling inside a background `leetcode.com` tab (requests carry your LeetCode cookies and a `leetcode.com` origin). LeetCode → NeetCode asks the NeetCode content script to call the judge / tick the roadmap with your Firebase session. |
 
@@ -78,7 +78,7 @@ python tools/build_mapping.py          # add --curl behind corporate proxies
 
 ## Limitations
 
-- **Only the 588 problems that exist on NeetCode** can be synced in either direction; LeetCode → NeetCode silently ignores the other ~3500 LeetCode problems.
+- **Only the problems listed on NeetCode** can be synced: the 588 with a NeetCode editor in both directions, the other 385 of NeetCode All (which NeetCode only links to LeetCode) as a roadmap tick from LeetCode. LeetCode → NeetCode silently ignores the remaining ~3100 LeetCode problems.
 - **LeetCode Premium problems** (161 of the 588) are skipped unless you enable them in settings and have Premium. NeetCode Pro-only problems may reject judge submissions without Pro; the roadmap tick still works.
 - **LeetCode → NeetCode judge submissions** don't trigger NeetCode's own GitHub auto-commit (that runs in NeetCode's UI); use NeetCode's *bulk sync* on its GitHub page afterwards if you want them there.
 - **Python 2, C, Ruby, Scala, Dart** solutions from LeetCode can only tick the roadmap; NeetCode's judge has no such languages.
