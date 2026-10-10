@@ -1,8 +1,9 @@
 // Runs in the page's MAIN world on leetcode.com (see manifest "world": "MAIN").
 //
 // Observes LeetCode's own submission traffic for the LeetCode -> NeetCode direction:
-//   * POST /problems/<slug>/submit/            body {lang, question_id, typed_code} -> {submission_id}
-//   * GET  /submissions/detail/<id>/check/     -> {state: "SUCCESS", status_msg: "Accepted", ...}
+//   * POST /problems/<slug>/submit/              body {lang, question_id, typed_code} -> {submission_id}
+//   * GET  /submissions/detail/<id>/v2/check/    -> {state: "SUCCESS", status_msg: "Accepted", ai_state, ...}
+//     (the problem page polls v2; the older /submissions/detail/<id>/check/ is matched as well)
 // When a submission reaches a final verdict the code is handed to the content script.
 //
 // Only page-initiated requests are visible here. The submissions neetbridge itself sends into a
@@ -13,7 +14,8 @@
   window.__n2lLcHooked = true;
 
   const SUBMIT_RE = /\/problems\/([^/?#]+)\/submit\/?(?:[?#]|$)/;
-  const CHECK_RE = /\/submissions\/detail\/(\d+)\/check\/?(?:[?#]|$)/;
+  // any id, not just digits: LeetCode's API now calls it submissionIdV2 (an ID, not an Int)
+  const CHECK_RE = /\/submissions\/detail\/([^/?#]+)\/(?:v2\/)?check\/?(?:[?#]|$)/;
   const pending = new Map();   // submission_id -> {slug, lang, code, questionId}
 
   const post = (msg) => {
@@ -49,6 +51,8 @@
   const onCheckResponse = (url, json) => {
     const m = CHECK_RE.exec(url);
     if (!m || !json || json.state !== 'SUCCESS') return;
+    // v2 reports SUCCESS while LeetCode's AI restriction check may still run; the page keeps polling.
+    if (json.ai_state === 'PENDING' || json.ai_state === 'STARTED') return;
     const submission = pending.get(m[1]);
     if (!submission) return;
     pending.delete(m[1]);
@@ -56,7 +60,8 @@
       type: 'N2L_LC_SUBMISSION',
       ...submission,
       submissionId: m[1],
-      status: json.status_msg || 'Unknown',
+      // LeetCode shows a failed AI check as a server error and status_code 50 as Restrictions Failed
+      status: json.ai_state === 'FAILURE' ? 'Internal Error' : json.status_code === 50 ? 'Restrictions Failed' : json.status_msg || 'Unknown',
       totalCorrect: json.total_correct,
       totalTestcases: json.total_testcases,
       at: Date.now(),

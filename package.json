@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Chrome extension: two-way sync between NeetCode and LeetCode (accepted solutions, roadmap ticks).",
   "scripts": {
-    "test": "node test/run.js && node test/sigfix.js"
+    "test": "node test/run.js && node test/sigfix.js && node test/hook.js"
   },
   "license": "MIT"
 }
