@@ -6,11 +6,26 @@
 // The NeetCode -> LeetCode submissions are executed by the background with chrome.scripting
 // directly in this tab; they do not go through this file.
 
+// A worker that is still waking up (or restarts mid-handler) can drop a message or answer nothing;
+// the background ignores duplicates, so retrying is safe.
+async function sendToBackground(message, tries = 4) {
+  let lastErr = null;
+  for (let i = 0; i < tries; i++) {
+    try {
+      const reply = await chrome.runtime.sendMessage(message);
+      if (reply !== undefined && reply !== null) return reply;
+      lastErr = new Error('no reply from background');
+    } catch (err) { lastErr = err; }
+    await new Promise((r) => setTimeout(r, 500 * (i + 1) * (i + 1)));
+  }
+  throw lastErr;
+}
+
 window.addEventListener('message', (event) => {
   if (event.source !== window || !event.data || event.data.__n2l !== true) return;
   const msg = event.data;
   if (msg.type !== 'N2L_LC_SUBMISSION' || msg.status !== 'Accepted') return;
-  chrome.runtime.sendMessage({
+  sendToBackground({
     type: 'N2L_LC_ACCEPTED',
     source: 'live',
     slug: msg.slug,

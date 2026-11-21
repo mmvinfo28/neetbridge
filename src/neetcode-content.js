@@ -18,6 +18,21 @@ let bulkAbort = false;
 
 // ---------------------------------------------------------------- hook events
 
+// Deliver a message to the service worker. A worker that is still waking up (or restarts mid-handler)
+// can drop a message or answer nothing; the background ignores duplicates, so retrying is safe.
+async function sendToBackground(message, tries = 4) {
+  let lastErr = null;
+  for (let i = 0; i < tries; i++) {
+    try {
+      const reply = await chrome.runtime.sendMessage(message);
+      if (reply !== undefined && reply !== null) return reply;
+      lastErr = new Error('no reply from background');
+    } catch (err) { lastErr = err; }
+    await new Promise((r) => setTimeout(r, 500 * (i + 1) * (i + 1)));
+  }
+  throw lastErr;
+}
+
 window.addEventListener('message', (event) => {
   if (event.source !== window || !event.data || event.data.__n2l !== true) return;
   const msg = event.data;
@@ -30,7 +45,7 @@ window.addEventListener('message', (event) => {
 
   if (msg.type === 'N2L_SUBMISSION') {
     if (msg.status !== 'Accepted') return;
-    chrome.runtime.sendMessage({
+    sendToBackground({
       type: 'N2L_ACCEPTED',
       source: 'live',
       problemId: msg.problemId,
@@ -40,7 +55,7 @@ window.addEventListener('message', (event) => {
     }).then((reply) => {
       if (reply && reply.queued) showToast(`Queued for LeetCode: ${reply.title || msg.problemId}`, 'info');
       else if (reply && reply.reason) showToast(reply.reason, reply.level || 'warn');
-    }).catch(() => { /* background unavailable */ });
+    }).catch(() => { /* background unavailable after retries */ });
   }
 });
 
@@ -114,7 +129,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 
   if (msg.type === 'N2L_PING') {
-    readFirebaseToken().then((tok) => sendResponse({ ok: true, hooked: true, hasHeaders: !!capturedHeaders, loggedIn: !!tok || !!capturedHeaders }));
+    readFirebaseToken().then((tok) => sendResponse({ ok: true, hooked: true, hasHeaders: !!capturedHeaders, loggedIn: !!tok || !!capturedHeaders,
+      // ready: a token the API calls can use right now (unexpired, or recently captured headers)
+      ready: (!!tok && (tok.expirationTime > Date.now() + 60_000 || !!(tok.refreshToken && tok.apiKey))) || (!!capturedHeaders && Date.now() - capturedAt < 50 * 60_000) }));
     return true;
   }
   return false;
@@ -122,12 +139,39 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 // ---------------------------------------------------------------- NeetCode API access
 
-function readFirebaseToken() {
+// Firebase keeps the signed-in user in IndexedDB by default, but in localStorage or
+// sessionStorage when the site picks that persistence. Check all three.
+function tokenFromUser(user) {
+  const tm = user && user.stsTokenManager;
+  return tm && tm.accessToken ? { accessToken: tm.accessToken, expirationTime: Number(tm.expirationTime) || 0,
+    refreshToken: tm.refreshToken || null, apiKey: (user && user.apiKey) || null } : null;
+}
+
+function readWebStorageToken() {
+  for (const store of [globalThis.localStorage, globalThis.sessionStorage]) {
+    try {
+      for (let i = 0; store && i < store.length; i++) {
+        const k = store.key(i);
+        if (!k || !k.startsWith('firebase:authUser:')) continue;
+        const tok = tokenFromUser(JSON.parse(store.getItem(k)));
+        if (tok) return tok;
+      }
+    } catch { /* storage blocked or bad JSON */ }
+  }
+  return null;
+}
+
+async function readFirebaseToken() {
+  return (await readIndexedDbToken()) || readWebStorageToken();
+}
+
+function readIndexedDbToken() {
   return new Promise((resolve) => {
     let req;
     try { req = indexedDB.open(FIREBASE_DB); } catch { return resolve(null); }
     req.onerror = () => resolve(null);
-    req.onupgradeneeded = () => { /* db did not exist; nothing to read */ };
+    // The db does not exist yet: abort instead of creating an empty one under Firebase's name.
+    req.onupgradeneeded = () => { try { req.transaction.abort(); } catch { /* ignore */ } };
     req.onsuccess = () => {
       const db = req.result;
       try {
@@ -136,14 +180,34 @@ function readFirebaseToken() {
         all.onsuccess = () => {
           const rows = all.result || [];
           const row = rows.find((r) => r && typeof r.fbase_key === 'string' && r.fbase_key.startsWith('firebase:authUser:'));
-          const tm = row && row.value && row.value.stsTokenManager;
           db.close();
-          resolve(tm && tm.accessToken ? { accessToken: tm.accessToken, expirationTime: Number(tm.expirationTime) || 0 } : null);
+          resolve(tokenFromUser(row && row.value));
         };
         all.onerror = () => { db.close(); resolve(null); };
       } catch { resolve(null); }
     };
   });
+}
+
+// Firebase only refreshes the stored ID token (1 h lifetime) while its own timers run, so a tab
+// that sat in the background holds an expired token. Exchange the refresh token the same way the
+// Firebase SDK does; the new token stays in memory only.
+let refreshed = null;   // { accessToken, expirationTime }
+async function refreshIdToken(tok) {
+  if (refreshed && refreshed.expirationTime > Date.now() + 60_000) return refreshed;
+  if (!tok || !tok.refreshToken || !tok.apiKey) return null;
+  try {
+    const res = await fetch(`https://securetoken.googleapis.com/v1/token?key=${encodeURIComponent(tok.apiKey)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: `grant_type=refresh_token&refresh_token=${encodeURIComponent(tok.refreshToken)}`,
+    });
+    if (!res.ok) return null;
+    const j = await res.json();
+    if (!j.id_token) return null;
+    refreshed = { accessToken: j.id_token, expirationTime: Date.now() + (Number(j.expires_in) || 3600) * 1000 };
+    return refreshed;
+  } catch { return null; }
 }
 
 async function getApiHeaders() {
@@ -159,6 +223,8 @@ async function getApiHeaders() {
   if (tok && tok.expirationTime > Date.now() + 60_000) {
     return { ...base, Authorization: `Bearer ${tok.accessToken}` };
   }
+  const fresh = tok && await refreshIdToken(tok);
+  if (fresh) return { ...base, Authorization: `Bearer ${fresh.accessToken}` };
   if (capturedHeaders && Date.now() - capturedAt < 50 * 60_000) {
     const authKey = Object.keys(capturedHeaders).find((k) => k.toLowerCase() === 'authorization');
     if (authKey) return { ...base, Authorization: capturedHeaders[authKey] };

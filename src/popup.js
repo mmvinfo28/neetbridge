@@ -135,6 +135,7 @@ for (const id of CONTROLS) {
 
 $('lcPill').addEventListener('click', () => chrome.tabs.create({ url: 'https://leetcode.com/' }));
 $('ncPill').addEventListener('click', () => chrome.tabs.create({ url: 'https://neetcode.io/practice' }));
+$('openMonitor').addEventListener('click', () => chrome.tabs.create({ url: chrome.runtime.getURL('src/debug.html') }));
 $('resume').addEventListener('click', async () => { await send({ type: 'resume' }); refresh(); checkSessions(); });
 $('clearQueue').addEventListener('click', async () => { await send({ type: 'clearQueue' }); refresh(); });
 $('clearLog').addEventListener('click', async () => { await send({ type: 'clearLog' }); refresh(); });
