@@ -27,6 +27,12 @@ const DEFAULT_SETTINGS = {
 };
 
 let processing = false;
+// Debug status for src/debug.html (session storage: gone on browser restart, so it never shows stale data).
+const debugStatus = { processing: false, lastRunStart: null, lastLoopAt: null, lastRunEnd: null, lastAction: '', swStartedAt: Date.now() };
+function setDebug(patch) {
+  Object.assign(debugStatus, patch);
+  try { chrome.storage.session.set({ debugStatus: { ...debugStatus } }).catch(() => {}); } catch { /* debug only */ }
+}
 let builtinMapping = null;   // { slug: {s, n, q, p, t} }
 let lcIndexCache = null;     // { at, userName, byNorm, byNum, bySlug }
 
@@ -394,28 +400,58 @@ async function enqueueReverse(raw, source, { dryRun = false, level = null } = {}
   return { queued: true, title: label };
 }
 
+const MAX_ATTEMPTS = 3;
+let rerunQueue = false;
+
 async function processQueue() {
-  if (processing) return;
+  // A call that arrives while the loop is running (e.g. an enqueue just after the loop saw an
+  // empty queue) must not be dropped: remember it and run once more when the loop ends.
+  if (processing) { rerunQueue = true; return; }
   processing = true;
+  rerunQueue = false;
+  setDebug({ processing: true, lastRunStart: Date.now(), lastLoopAt: Date.now(), lastAction: 'start' });
   try {
     for (;;) {
+      setDebug({ lastLoopAt: Date.now(), lastAction: 'loop iteration' });
       const st = await getLocal(['queue', 'paused', 'lastSubmitAt']);
       if (st.paused) break;
       const queue = st.queue || [];
-      const item = queue[0];
-      if (!item) break;
+      if (!queue.length) break;
 
+      // A failed item waits out its own backoff (notBefore) without blocking the others: pick the
+      // first item that is due, not simply queue[0].
       const settings = await getSettings();
       const gapMs = Math.max(10, Number(settings.delaySec) || 30) * 1000;
-      const readyAt = Math.max((st.lastSubmitAt || 0) + gapMs, item.notBefore || 0);
-      const wait = item.inFlight ? 0 : readyAt - Date.now();
-      if (wait > 0) {
-        if (wait <= 25_000) { await sleep(wait); continue; }
-        await chrome.alarms.create(ALARM, { when: Date.now() + wait });
-        break;
+      const now = Date.now();
+      const inFlight = queue.find((q) => q.inFlight);
+      const item = inFlight || queue.find((q) => (q.notBefore || 0) <= now);
+      if (!inFlight) {
+        const dueAt = item ? now : Math.min(...queue.map((q) => q.notBefore || 0));
+        const wait = Math.max(dueAt, (st.lastSubmitAt || 0) + gapMs) - now;
+        if (wait > 0) {
+          if (wait <= 25_000) { await sleep(wait); continue; }
+          await chrome.alarms.create(ALARM, { when: Date.now() + wait });
+          break;
+        }
       }
 
-      const outcome = item.direction === 'lc2nc' ? await handleReverseItem(item) : await handleItem(item);
+      const base = item.direction === 'lc2nc' ? logBaseReverse : logBase;
+      let outcome;
+      try {
+        outcome = item.direction === 'lc2nc' ? await handleReverseItem(item) : await handleItem(item);
+      } catch (err) {
+        // An unexpected throw used to leave the item at the head and retry it forever.
+        item.attempts = (item.attempts || 0) + 1;
+        const msg = String((err && err.message) || err);
+        if (item.attempts < MAX_ATTEMPTS) {
+          item.notBefore = Date.now() + 60_000 * item.attempts;
+          await appendLog({ ...base(item), status: 'Retry scheduled', detail: msg });
+          outcome = 'retry';
+        } else {
+          await appendLog({ ...base(item), status: 'Failed', detail: `${msg} (gave up after ${item.attempts} attempts)` });
+          outcome = 'done';
+        }
+      }
       if (outcome === 'paused') break;
       await mutateQueue((queue) => {
         const idx = queue.findIndex((q) => q.id === item.id);
@@ -424,13 +460,16 @@ async function processQueue() {
         else queue.splice(idx, 1);
       });
     }
+    await closeHelperTabsIfIdle();
   } catch (err) {
     console.error('[neetbridge] queue error', err);
     await appendLog({ status: 'Error', detail: `${String((err && err.message) || err)} - retrying in 1 min` });
     await chrome.alarms.create(ALARM, { when: Date.now() + 60_000 });
   } finally {
     processing = false;
+    setDebug({ processing: false, lastRunEnd: Date.now(), lastAction: 'idle' });
   }
+  if (rerunQueue) { rerunQueue = false; processQueue(); }
 }
 
 async function pauseQueue(reason) {
@@ -527,9 +566,13 @@ async function handleReverseItem(item) {
   }
   await setLocal({ lastSubmitAt: Date.now() });
 
-  const parts = [];
+  let parts = [];
   let status = 'Accepted';
-  if (item.mode === 'submit') {
+  if (item.judged) {
+    // The judge already ran on an earlier attempt (only the tick failed): do not submit again.
+    status = item.judged.status;
+    parts = [...item.judged.parts];
+  } else if (item.mode === 'submit') {
     let code = item.code;
     let notes = [];
     try {
@@ -569,16 +612,36 @@ async function handleReverseItem(item) {
   }
 
   // Tick the roadmap regardless of the judge result (the LeetCode verdict was Accepted).
+  let tickError = null;
   if (topic) {
     try {
       // Practice checkboxes compare this full URL, not the short "<slug>/" form.
       const m = await chrome.tabs.sendMessage(tabId, { type: 'N2L_NC_MARK', topic, link: lcRoadmapLink(slug) });
-      parts.push(m && m.ok ? `ticked in ${topic}` : `tick failed: ${(m && m.error) || 'no response'}`);
+      if (m && m.ok) parts.push(`ticked in ${topic}`);
+      else tickError = (m && m.error) || 'no response';
     } catch (err) {
-      parts.push(`tick failed: ${String((err && err.message) || err)}`);
+      tickError = String((err && err.message) || err);
     }
   } else {
     parts.push('no topic known, roadmap not ticked');
+  }
+
+  if (tickError) {
+    const noSession = /logged in|session/i.test(tickError);
+    if (item.attempts < 2) {
+      // Capped retry with backoff; a no-session error usually means the tab was still starting up.
+      item.attempts += 1;
+      item.notBefore = Date.now() + 60_000 * item.attempts;
+      if (item.mode === 'submit') item.judged = { status, parts };
+      await appendLog({ ...logBaseReverse(item), status: 'Retry scheduled', detail: `tick failed: ${tickError}` });
+      return 'retry';
+    }
+    if (noSession) {
+      await pauseQueue('Not logged in on NeetCode. Log in at neetcode.io, then press Resume in the popup.');
+      return 'paused';
+    }
+    parts.push(`tick failed: ${tickError}`);
+    if (status === 'Accepted') status = 'Tick failed';
   }
 
   const detail = parts.filter(Boolean).join(' | ');
@@ -588,8 +651,8 @@ async function handleReverseItem(item) {
   await setLocal({ synced });
 
   const ok = status === 'Accepted';
-  await notifySites(`${label}: ${item.mode === 'submit' ? status : 'ticked'}`, ok ? 'ok' : 'error', problemUrl);
-  await notifyDesktop(ok, `${label} (#${num})`, item.mode === 'submit' ? `${status} on NeetCode` : 'Ticked on NeetCode', detail, problemUrl);
+  await notifySites(`${label}: ${status === 'Tick failed' || item.mode === 'submit' ? status : 'ticked'}`, ok ? 'ok' : 'error', problemUrl);
+  await notifyDesktop(ok, `${label} (#${num})`, status === 'Tick failed' ? status : (item.mode === 'submit' ? `${status} on NeetCode` : 'Ticked on NeetCode'), detail, problemUrl);
   return 'done';
 }
 
@@ -619,27 +682,84 @@ async function resolveReverseFix(item) {
 }
 
 
-async function getNeetCodeTabId() {
-  const tabs = await chrome.tabs.query({ url: 'https://neetcode.io/*' });
-  let tab = tabs.find((t) => t.status === 'complete' && !t.discarded) || tabs[0];
-  if (!tab) {
-    tab = await chrome.tabs.create({ url: 'https://neetcode.io/practice', active: false });
-    await waitTabComplete(tab.id);
-    await sleep(3000);
-  } else if (tab.discarded || tab.status !== 'complete') {
-    if (tab.discarded) await chrome.tabs.reload(tab.id);
-    await waitTabComplete(tab.id);
-    await sleep(2000);
+// ---- helper tabs: at most one per site, created under a lock, remembered across service-worker
+// restarts, and closed again once the queue is idle (only tabs this extension opened).
+const tabLocks = {};
+function withTabLock(site, fn) {
+  const p = (tabLocks[site] || Promise.resolve()).then(fn, fn);
+  tabLocks[site] = p.catch(() => {});
+  return p;
+}
+
+async function getHelperTab(site) {
+  const { helperTabs = {} } = await getLocal('helperTabs');
+  if (!helperTabs[site]) return null;
+  try { return await chrome.tabs.get(helperTabs[site]); } catch { return null; }
+}
+
+async function createHelperTab(site, url) {
+  const tab = await chrome.tabs.create({ url, active: false });
+  const { helperTabs = {} } = await getLocal('helperTabs');
+  helperTabs[site] = tab.id;
+  await setLocal({ helperTabs });
+  return tab;
+}
+
+async function closeHelperTabsIfIdle() {
+  const { helperTabs = {}, bulk, queue = [] } = await getLocal(['helperTabs', 'bulk', 'queue']);
+  if (!Object.keys(helperTabs).length || queue.length || (bulk && bulk.running)) return;
+  for (const id of Object.values(helperTabs)) {
+    try {
+      const t = await chrome.tabs.get(id);
+      if (!t.active) await chrome.tabs.remove(id);   // never close a tab the user is looking at
+    } catch { /* already closed */ }
   }
-  try {
-    await chrome.tabs.sendMessage(tab.id, { type: 'N2L_PING' });
-  } catch {
-    await chrome.tabs.reload(tab.id);
-    await waitTabComplete(tab.id);
-    await sleep(3000);
-    await chrome.tabs.sendMessage(tab.id, { type: 'N2L_PING' });
-  }
-  return tab.id;
+  await setLocal({ helperTabs: {} });
+}
+
+function pingNeetCodeTab(t) {
+  return Promise.race([
+    chrome.tabs.sendMessage(t.id, { type: 'N2L_PING' }).catch(() => null),
+    sleep(3000).then(() => null),
+  ]);
+}
+
+// Pick a neetcode.io tab that actually holds a NeetCode session. The old code used the first tab and
+// never looked at whether it was logged in, so a tab on a logged-out/uninitialised page produced
+// "no session token found" even though another tab (or a reload) would have worked.
+function getNeetCodeTabId() {
+  return withTabLock('neetcode', async () => {
+    let tabs = await chrome.tabs.query({ url: 'https://neetcode.io/*' });
+    if (!tabs.length) {
+      const helper = await getHelperTab('neetcode');   // created moments ago, URL not committed yet
+      if (helper) tabs = [helper];
+    }
+    if (!tabs.length) {
+      const created = await createHelperTab('neetcode', 'https://neetcode.io/practice');
+      await waitTabComplete(created.id);
+      await sleep(3000);   // let NeetCode's app + Firebase auth initialise
+      tabs = [created];
+    }
+    for (const t of tabs) {
+      if (t.discarded) { await chrome.tabs.reload(t.id); await waitTabComplete(t.id); await sleep(2000); }
+      else if (t.status !== 'complete') { await waitTabComplete(t.id); await sleep(2000); }
+    }
+    const live = [];
+    for (const t of tabs) live.push([t, await pingNeetCodeTab(t)]);
+    const good = live.find(([, r]) => r && r.ok && (r.ready ?? r.loggedIn));
+    if (good) return good[0].id;
+    // Nobody has a usable token. Reload one background tab once (re-initialises Firebase and
+    // refreshes an expired token); never reload the tab the user is looking at.
+    const cand = (live.find(([t]) => !t.active) || live[0])[0];
+    if (!cand.active) {
+      await chrome.tabs.reload(cand.id);
+      await waitTabComplete(cand.id);
+      await sleep(3000);
+    }
+    const r = await pingNeetCodeTab(cand);
+    if (!r) throw new Error('The neetcode.io tab did not respond (content script not loaded). Reload it.');
+    return cand.id;
+  });
 }
 
 // Reverse bulk: every problem accepted on LeetCode that exists on NeetCode and is not ticked there yet.
@@ -753,18 +873,24 @@ function waitTabComplete(tabId, timeoutMs = 30_000) {
   });
 }
 
-async function getLeetCodeTabId() {
-  const tabs = await chrome.tabs.query({ url: 'https://leetcode.com/*' });
-  const tab = tabs.find((t) => t.status === 'complete' && !t.discarded) || tabs.find((t) => !t.discarded) || tabs[0];
-  if (tab) {
-    if (tab.discarded) { await chrome.tabs.reload(tab.id); }
-    await waitTabComplete(tab.id);
-    return tab.id;
-  }
-  const created = await chrome.tabs.create({ url: 'https://leetcode.com/problemset/', active: false });
-  await waitTabComplete(created.id);
-  await sleep(1000);
-  return created.id;
+function getLeetCodeTabId() {
+  return withTabLock('leetcode', async () => {
+    let tabs = await chrome.tabs.query({ url: 'https://leetcode.com/*' });
+    if (!tabs.length) {
+      const helper = await getHelperTab('leetcode');   // created moments ago, URL not committed yet
+      if (helper) tabs = [helper];
+    }
+    const tab = tabs.find((t) => t.status === 'complete' && !t.discarded) || tabs.find((t) => !t.discarded) || tabs[0];
+    if (tab) {
+      if (tab.discarded) { await chrome.tabs.reload(tab.id); }
+      await waitTabComplete(tab.id);
+      return tab.id;
+    }
+    const created = await createHelperTab('leetcode', 'https://leetcode.com/problemset/');
+    await waitTabComplete(created.id);
+    await sleep(1000);
+    return created.id;
+  });
 }
 
 async function runInTab(tabId, func, arg) {
@@ -906,23 +1032,12 @@ function lcCheckInPage(p) {
 async function startBulk(options = {}) {
   await setLocal({ bulk: { running: true, phase: 'starting', done: 0, total: 0, found: 0, queued: 0,
     dryRun: !!options.dryRun, startedAt: Date.now(), error: null } });
-  let tabs = await chrome.tabs.query({ url: 'https://neetcode.io/*' });
-  let tab = tabs.find((t) => t.status === 'complete' && !t.discarded) || tabs[0];
-  if (!tab) {
-    tab = await chrome.tabs.create({ url: 'https://neetcode.io/practice', active: false });
-    await waitTabComplete(tab.id);
-    await sleep(3000); // let NeetCode's app + Firebase auth initialise
-  } else if (tab.discarded || tab.status !== 'complete') {
-    if (tab.discarded) await chrome.tabs.reload(tab.id);
-    await waitTabComplete(tab.id);
-    await sleep(2000);
-  }
+  let tab;
   try {
-    await chrome.tabs.sendMessage(tab.id, { type: 'N2L_PING' });
-  } catch {
-    await chrome.tabs.reload(tab.id);
-    await waitTabComplete(tab.id);
-    await sleep(3000);
+    tab = { id: await getNeetCodeTabId() };
+  } catch (err) {
+    await setLocal({ bulk: { running: false, phase: 'error', error: `Could not reach the NeetCode tab: ${err.message}` } });
+    return;
   }
   try {
     await chrome.tabs.sendMessage(tab.id, { type: 'N2L_COLLECT', options });
@@ -1009,15 +1124,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case 'checkNeetCode': {
         const tabs = await chrome.tabs.query({ url: 'https://neetcode.io/*' });
         if (!tabs.length) return { loggedIn: false, noTab: true };
-        let stale = false;
-        for (const t of tabs) {
-          try {
-            const r = await chrome.tabs.sendMessage(t.id, { type: 'N2L_PING' });
-            if (r && r.ok && r.loggedIn !== undefined) return { loggedIn: !!r.loggedIn };
-            if (r && r.ok) stale = true;   // content script from before the last extension reload
-          } catch { stale = true; }
-        }
-        return { loggedIn: false, stale, error: 'Reload the neetcode.io tab.' };
+        // Ask every tab at once and take the best answer: one logged-in tab is enough. (Returning
+        // on the first reply let a single tab without a token hide all the others.) Discarded
+        // (Memory Saver) tabs have no running content script, so they are skipped, not "stale".
+        const live = tabs.filter((t) => !t.discarded);
+        const replies = await Promise.all(live.map((t) =>
+          Promise.race([
+            chrome.tabs.sendMessage(t.id, { type: 'N2L_PING' }).catch(() => null),
+            sleep(3000).then(() => null),
+          ])));
+        if (replies.some((r) => r && r.ok && r.loggedIn)) return { loggedIn: true };
+        if (replies.some((r) => r && r.ok && r.loggedIn === false)) return { loggedIn: false, error: 'No NeetCode session found in any open tab. Log in on neetcode.io, then reload the tab.' };
+        // Only old content scripts (from before the last extension reload) or sleeping tabs.
+        return { loggedIn: false, stale: true, error: 'Reload a neetcode.io tab.' };
       }
       case 'resume': {
         await setLocal({ paused: null });

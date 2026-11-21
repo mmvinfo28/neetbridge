@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>neetbridge monitor</title>
+  <style>
+    body { font: 13px/1.4 ui-monospace, Consolas, monospace; margin: 16px; color: #1b1b1b; background: #fff; }
+    @media (prefers-color-scheme: dark) { body { color: #ddd; background: #181818; } th { background: #2a2a2a; } }
+    h2 { margin: 18px 0 6px; font-size: 14px; }
+    table { border-collapse: collapse; width: 100%; margin-bottom: 6px; }
+    th, td { border: 1px solid #8884; padding: 3px 6px; text-align: left; vertical-align: top; word-break: break-word; }
+    th { background: #eee; }
+    pre { white-space: pre-wrap; border: 1px solid #8884; padding: 8px; max-height: 400px; overflow: auto; }
+    .muted { opacity: .65; }
+  </style>
+</head>
+<body>
+  <h1>neetbridge monitor</h1>
+  <div id="updated" class="muted"></div>
+  <div id="root"></div>
+  <h2>JSON</h2>
+  <pre id="json"></pre>
+  <script src="debug.js"></script>
+</body>
+</html>
